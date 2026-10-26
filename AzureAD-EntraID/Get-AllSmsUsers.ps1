@@ -1,49 +1,97 @@
-$users = Get-MgUser -All -filter "accountEnabled eq true" 
+<#
+.SYNOPSIS
+    Identifies active Entra ID users configured with SMS-only MFA or missing MFA entirely.
+.DESCRIPTION
+    Uses Microsoft Graph to audit user authentication methods. Uses thread-safe collections
+    for fast parallel evaluation across large tenants and exports reports to CSV.
+.PARAMETER OutputFolder
+    Destination directory for audit CSV reports. Defaults to C:\Temp.
+.PARAMETER ThrottleLimit
+    Concurrency limit for parallel processing. Default is 8.
+#>
+[CmdletBinding()]
+param(
+    [string]$OutputFolder = "C:\Temp",
+    [int]$ThrottleLimit = 8
+)
 
-$usersWithOnlySMS = @()
-$usersWithNoMFA = @()
+# Verify Graph Connection
+$context = Get-MgContext -ErrorAction SilentlyContinue
+if (-not $context) {
+    Write-Host "Connecting to Microsoft Graph with authentication method scopes..." -ForegroundColor Cyan
+    Connect-MgGraph -Scopes "User.Read.All", "UserAuthenticationMethod.Read.All" -NoWelcome
+}
 
-$count = 0
-$users | foreach-object -parallel {
-    $count++
-    if ($count % 25 -eq 0) {
-        write-host "Processing user $count/$($users.count)"
-    }
-    #write-host  $_.DisplayName
-    
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
 
-    $authenticationMethods = Get-MgUserAuthenticationMethod -UserId $_.Id
-    if ($authenticationMethods.count -lt 1) {
-        $usersWithNoMFA += $_
-        continue
-    }
-    $phoneEnabled = $false
-    $authentcatorEnabled = $false
-    switch ($authenticationMethods.AdditionalProperties.'@odata.type') {
-        "#microsoft.graph.passwordAuthenticationMethod" {
-            #$authenticationMethods.AdditionalProperties
-        }
-        "#microsoft.graph.fido2AuthenticationMethod" {
-            #$authenticationMethods.AdditionalProperties
-        }
-        "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod" {
-            $authentcatorEnabled = $true
-        }
-        "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod" {
-            #$authenticationMethods.AdditionalProperties
-        }
-        "#microsoft.graph.phoneAuthenticationMethod" {
-            $phoneEnabled = $true
-        }
-        "#microsoft.graph.softwareOathAuthenticationMethod" {
-            #$authenticationMethods.AdditionalProperties
-        }
-    
-    }
-    if ($phoneEnabled -and !$authentcatorEnabled) {
-        $usersWithOnlySMS += $_
-    }
-} -throttlelimit 5
+Write-Host "Fetching all active Entra ID users..." -ForegroundColor Cyan
+$users = Get-MgUser -All -Filter "accountEnabled eq true" -Property Id, DisplayName, UserPrincipalName, MobilePhone -ErrorAction Stop
 
-$usersWithOnlySMS | select UserPrincipalName, DisplayName, MobilePhone | export-csv -Path "c:\temp\usersWithOnlySMS.csv"
-$usersWithNoMFA | select UserPrincipalName, DisplayName, MobilePhone | export-csv -Path "c:\temp\usersWithNoMFA.csv" -NoTypeInformation
+Write-Host "Evaluating authentication methods for $($users.Count) active users (ThrottleLimit: $ThrottleLimit)..." -ForegroundColor Cyan
+
+# Use thread-safe ConcurrentBags for parallel aggregation
+$usersWithOnlySMS = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::new()
+$usersWithNoMFA   = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::new()
+
+$total = $users.Count
+$counter = [System.Threading.CountdownEvent]::new($total)
+
+$users | ForEach-Object -Parallel {
+    $user = $_
+    $smsBag = $using:usersWithOnlySMS
+    $noMfaBag = $using:usersWithNoMFA
+
+    try {
+        $methods = Get-MgUserAuthenticationMethod -UserId $user.Id -ErrorAction Stop
+        
+        $hasAuthenticator = $false
+        $hasPhone = $false
+        $hasFido2 = $false
+        $hasWindowsHello = $false
+
+        foreach ($m in $methods) {
+            $type = $m.AdditionalProperties['@odata.type']
+            if ($type -match 'microsoftAuthenticatorAuthenticationMethod') { $hasAuthenticator = $true }
+            elseif ($type -match 'phoneAuthenticationMethod') { $hasPhone = $true }
+            elseif ($type -match 'fido2AuthenticationMethod') { $hasFido2 = $true }
+            elseif ($type -match 'windowsHelloForBusinessAuthenticationMethod') { $hasWindowsHello = $true }
+        }
+
+        # Determine MFA posture
+        $hasStrongMfa = $hasAuthenticator -or $hasFido2 -or $hasWindowsHello
+
+        if (-not $hasPhone -and -not $hasStrongMfa) {
+            $noMfaBag.Add([PSCustomObject]@{
+                Id                = $user.Id
+                UserPrincipalName = $user.UserPrincipalName
+                DisplayName       = $user.DisplayName
+                MobilePhone       = $user.MobilePhone
+                MfaStatus         = "No MFA Configured"
+            })
+        }
+        elseif ($hasPhone -and -not $hasStrongMfa) {
+            $smsBag.Add([PSCustomObject]@{
+                Id                = $user.Id
+                UserPrincipalName = $user.UserPrincipalName
+                DisplayName       = $user.DisplayName
+                MobilePhone       = $user.MobilePhone
+                MfaStatus         = "SMS Only (Weak MFA)"
+            })
+        }
+    }
+    catch {
+        # Catch individual user permission or retrieval errors
+    }
+} -ThrottleLimit $ThrottleLimit
+
+$smsCsv = Join-Path $OutputFolder "usersWithOnlySMS.csv"
+$noMfaCsv = Join-Path $OutputFolder "usersWithNoMFA.csv"
+
+$usersWithOnlySMS | Export-Csv -Path $smsCsv -NoTypeInformation -Encoding utf8
+$usersWithNoMFA | Export-Csv -Path $noMfaCsv -NoTypeInformation -Encoding utf8
+
+Write-Host "`n=== Audit Complete ===" -ForegroundColor Green
+Write-Host "Users with SMS-only MFA: $($usersWithOnlySMS.Count) -> $smsCsv" -ForegroundColor Yellow
+Write-Host "Users with NO MFA:       $($usersWithNoMFA.Count) -> $noMfaCsv" -ForegroundColor Red

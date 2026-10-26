@@ -1,28 +1,70 @@
-# Check if the mggraph module is already installed
-if (-not (Get-Module -ListAvailable -Name mggraph)) {
-    # If not installed, install the mggraph module
-    Install-Module -Name mggraph -Force
+<#
+.SYNOPSIS
+    Assigns an Autopilot GroupTag to Windows Autopilot enrolled devices that lack tags.
+.DESCRIPTION
+    Uses Microsoft Graph DeviceManagement module to query and update Autopilot Device Identities.
+.PARAMETER GroupTag
+    The group tag to assign to untagged devices. Default is "Standard".
+.EXAMPLE
+    .\Set-AutopilotTags.ps1 -GroupTag "Kiosk-Devices"
+#>
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [string]$GroupTag = "Standard",
+    [switch]$IncludeMissingPurchaseOrder
+)
+
+# Connect to Microsoft Graph
+$context = Get-MgContext -ErrorAction SilentlyContinue
+if (-not $context) {
+    Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+    Connect-MgGraph -Scopes "DeviceManagementServiceConfig.ReadWrite.All" -NoWelcome
 }
 
-# Import the mggraph module
-Import-Module -Name mggraph
-
-# Connect to the Microsoft Graph API with the required scopes
-Connect-MgGraph -Scopes DeviceManagementServiceConfig.Read.All, DeviceManagementServiceConfig.ReadWrite.All
-
-# Get a list of Autopilot devices
-$autopilotDevices = Get-AutopilotDevice
-
-# Filter devices that do not have a groupTag or purchaseOrderIdentifier
-$devicesWithoutTagsOrPOI = $autopilotDevices | Where-Object { $_.GroupTag -eq $null -or $_.PurchaseOrderIdentifier -eq $null }
-
-# Define the groupTag value to assign to devices without tags
-$newGroupTag = "Tag"
-
-# Loop through devices without tags or purchase order identifiers and set the groupTag
-foreach ($device in $devicesWithoutTagsOrPOI) {
-    Set-AutopilotDevice -DeviceId $device.DeviceId -GroupTag $newGroupTag
+Write-Host "Retrieving Windows Autopilot enrolled devices..." -ForegroundColor Cyan
+try {
+    $devices = Get-MgDeviceManagementWindowsAutopilotDeviceIdentity -All -ErrorAction Stop
+}
+catch {
+    Write-Error "Failed to retrieve Autopilot devices: $($_.Exception.Message)"
+    return
 }
 
-# Output a message indicating the completion of the operation
-Write-Host "GroupTag has been set for devices without tags or purchase order identifiers."
+if (-not $devices -or $devices.Count -eq 0) {
+    Write-Host "No Autopilot devices registered in this tenant." -ForegroundColor Yellow
+    return
+}
+
+# Filter untagged devices
+$targetDevices = $devices | Where-Object {
+    $missingTag = [string]::IsNullOrWhiteSpace($_.GroupTag)
+    if ($IncludeMissingPurchaseOrder) {
+        $missingTag -or [string]::IsNullOrWhiteSpace($_.PurchaseOrderIdentifier)
+    } else {
+        $missingTag
+    }
+}
+
+Write-Host "Found $($targetDevices.Count) device(s) requiring GroupTag assignment." -ForegroundColor Cyan
+
+$updatedCount = 0
+foreach ($dev in $targetDevices) {
+    $devName = if ($dev.SerialNumber) { $dev.SerialNumber } else { $dev.Id }
+    
+    if ($PSCmdlet.ShouldProcess("Serial: $devName (Current Tag: '$($dev.GroupTag)')", "Set GroupTag to '$GroupTag'")) {
+        try {
+            Update-MgDeviceManagementWindowsAutopilotDeviceIdentity `
+                -WindowsAutopilotDeviceIdentityId $dev.Id `
+                -GroupTag $GroupTag `
+                -ErrorAction Stop
+
+            Write-Host "[UPDATED] Serial: $devName -> GroupTag: '$GroupTag'" -ForegroundColor Green
+            $updatedCount++
+        }
+        catch {
+            Write-Warning "Failed to update $devName : $($_.Exception.Message)"
+        }
+    }
+}
+
+Write-Host "`nCompleted: Successfully assigned GroupTag to $updatedCount device(s)." -ForegroundColor Green
